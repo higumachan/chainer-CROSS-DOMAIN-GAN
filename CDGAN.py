@@ -23,7 +23,8 @@ import chainer.links as L
 import numpy
 
 
-image_dir = './images'
+s_image_dir = '/disk1/img_align_celeba/'
+t_image_dir = '/disk1/animecroped_resized/images/'
 out_image_dir = './out_images'
 out_model_dir = './out_models'
 
@@ -34,17 +35,33 @@ n_epoch=10000
 n_train=200000
 image_save_interval = 50000
 
+alpha = 100
+beta = 1
+gamma = 0.05
+
 # read all images
 
 fs = os.listdir(image_dir)
 print len(fs)
-dataset = []
+s_dataset = []
 for fn in fs:
     f = open('%s/%s'%(image_dir,fn), 'rb')
     img_bin = f.read()
-    dataset.append(img_bin)
+    s_dataset.append(img_bin)
     f.close()
-print len(dataset)
+
+fs = os.listdir(image_dir)
+print len(fs)
+t_dataset = []
+for fn in fs:
+    f = open('%s/%s'%(image_dir,fn), 'rb')
+    img_bin = f.read()
+    s_dataset.append(img_bin)
+    f.close()
+
+
+print "source images", len(s_dataset)
+print "target images", len(t_dataset)
 
 class ELU(function.Function):
 
@@ -95,8 +112,6 @@ def elu(x, alpha=1.0):
     return ELU(alpha=alpha)(x)
 
 
-
-
 class Generator(chainer.Chain):
     def __init__(self):
         super(Generator, self).__init__(
@@ -110,15 +125,31 @@ class Generator(chainer.Chain):
             bn1 = L.BatchNormalization(256),
             bn2 = L.BatchNormalization(128),
             bn3 = L.BatchNormalization(64),
+
+            c0 = L.Convolution2D(3, 64, 4, stride=2, pad=1, wscale=0.02*math.sqrt(4*4*3)),
+            c1 = L.Convolution2D(64, 128, 4, stride=2, pad=1, wscale=0.02*math.sqrt(4*4*64)),
+            c2 = L.Convolution2D(128, 256, 4, stride=2, pad=1, wscale=0.02*math.sqrt(4*4*128)),
+            c3 = L.Convolution2D(256, 512, 4, stride=2, pad=1, wscale=0.02*math.sqrt(4*4*256)),
+            l4l = L.Linear(6*6*512, nz, wscale=0.02*math.sqrt(6*6*512)),
+            cbn0 = L.BatchNormalization(64),
+            cbn1 = L.BatchNormalization(128),
+            cbn2 = L.BatchNormalization(256),
+            cbn3 = L.BatchNormalization(512),
+
         )
         
-    def __call__(self, z, test=False):
+    def __call__(self, x, test=False):
+        h = F.relu(self.c0(x))     # no bn because images from generator will katayotteru?
+        h = F.relu(self.cbn1(self.c1(h), test=test))
+        h = F.relu(self.cbn2(self.c2(h), test=test))
+        z = F.relu(self.cbn3(self.c3(h), test=test))
+
         h = F.reshape(F.relu(self.bn0l(self.l0z(z), test=test)), (z.data.shape[0], 512, 6, 6))
         h = F.relu(self.bn1(self.dc1(h), test=test))
         h = F.relu(self.bn2(self.dc2(h), test=test))
         h = F.relu(self.bn3(self.dc3(h), test=test))
         x = (self.dc4(h))
-        return x
+        return x, z
 
 
 
@@ -129,7 +160,7 @@ class Discriminator(chainer.Chain):
             c1 = L.Convolution2D(64, 128, 4, stride=2, pad=1, wscale=0.02*math.sqrt(4*4*64)),
             c2 = L.Convolution2D(128, 256, 4, stride=2, pad=1, wscale=0.02*math.sqrt(4*4*128)),
             c3 = L.Convolution2D(256, 512, 4, stride=2, pad=1, wscale=0.02*math.sqrt(4*4*256)),
-            l4l = L.Linear(6*6*512, 2, wscale=0.02*math.sqrt(6*6*512)),
+            l4l = L.Linear(6*6*512, 3, wscale=0.02*math.sqrt(6*6*512)),
             bn0 = L.BatchNormalization(64),
             bn1 = L.BatchNormalization(128),
             bn2 = L.BatchNormalization(256),
@@ -145,10 +176,8 @@ class Discriminator(chainer.Chain):
         return l
 
 
-
-
 def clip_img(x):
-	return np.float32(-1 if x<-1 else (1 if x>1 else x))
+    return np.float32(-1 if x<-1 else (1 if x>1 else x))
 
 
 def train_dcgan_labeled(gen, dis, epoch0=0):
@@ -168,37 +197,58 @@ def train_dcgan_labeled(gen, dis, epoch0=0):
         
         for i in xrange(0, n_train, batchsize):
             # discriminator
-            # 0: from dataset
-            # 1: from noise
+            # 0: from s_dataset
+            # 1: from s_dataset encode decode
+            # 2: from s_dataset encode decode
 
             #print "load image start ", i
-            x2 = np.zeros((batchsize, 3, 96, 96), dtype=np.float32)
+            sx = np.zeros((batchsize, 3, 96, 96), dtype=np.float32)
+            tx = np.zeros((batchsize, 3, 96, 96), dtype=np.float32)
             for j in range(batchsize):
                 try:
-                    rnd = np.random.randint(len(dataset))
-                    rnd2 = np.random.randint(2)
+                    s_rnd = np.random.randint(len(s_dataset))
+                    t_rnd = np.random.randint(len(t_dataset))
+                    s_rnd2 = np.random.randint(2)
+                    t_rnd2 = np.random.randint(2)
 
-                    img = np.asarray(Image.open(StringIO(dataset[rnd])).convert('RGB')).astype(np.float32).transpose(2, 0, 1)
-                    if rnd2==0:
-                        x2[j,:,:,:] = (img[:,:,::-1]-128.0)/128.0
+                    s_img = np.asarray(Image.open(StringIO(s_dataset[s_rnd])).convert('RGB')).astype(np.float32).transpose(2, 0, 1)
+                    t_img = np.asarray(Image.open(StringIO(s_dataset[t_rnd])).convert('RGB')).astype(np.float32).transpose(2, 0, 1)
+                    if s_rnd2==0:
+                        sx[j,:,:,:] = (s_img[:,:,::-1]-128.0)/128.0
                     else:
-                        x2[j,:,:,:] = (img[:,:,:]-128.0)/128.0
+                        sx[j,:,:,:] = (s_img[:,:,:]-128.0)/128.0
+                    if t_rnd2==0:
+                        tx[j,:,:,:] = (t_img[:,:,::-1]-128.0)/128.0
+                    else:
+                        tx[j,:,:,:] = (t_img[:,:,:]-128.0)/128.0
+
                 except:
-                    print 'read image error occured', fs[rnd]
+                    print 'read image error occured', fs[t_rnd]
             #print "load image done"
             
             # train generator
-            z = Variable(xp.random.uniform(-1, 1, (batchsize, nz), dtype=np.float32))
-            x = gen(z)
-            yl = dis(x)
-            L_gen = F.softmax_cross_entropy(yl, Variable(xp.zeros(batchsize, dtype=np.int32)))
-            L_dis = F.softmax_cross_entropy(yl, Variable(xp.ones(batchsize, dtype=np.int32)))
+            sx = Variable(cuda.to_gpu(sx))
+            tx = Variable(cuda.to_gpu(tx))
+            sx2, sz = gen(sx)
+            tx2, tz = gen(tx)
+            sx3, sz2 = gen(sx2)
+            L_tid = F.mean_squared_error(tx, tx2)
+            L_const = F.mean_squared_error(sz, sz2)
+            L_tv = (((sx2[:,1:] - sx2) ** 2  + (sx2[:,:,1:] - sx2) ** 2) + ((tx2[:,1:] - tx2) ** 2  + (tx2[:,:,1:] - tx2) ** 2) ** 0.5) / float(batchsize)
             
             # train discriminator
                     
-            x2 = Variable(cuda.to_gpu(x2))
-            yl2 = dis(x2)
-            L_dis += F.softmax_cross_entropy(yl2, Variable(xp.zeros(batchsize, dtype=np.int32)))
+            yl_sx2 = dis(sx2)
+            yl_tx2 = dis(tx2)
+            yl_tx = dis(tx)
+            L_dis = F.softmax_cross_entropy(yl_sx2, Variable(xp.zeros(batchsize, dtype=np.int32)))
+            L_dis += F.softmax_cross_entropy(yl_tx2, Variable(xp.ones(batchsize, dtype=np.int32)))
+            L_dis += F.softmax_cross_entropy(yl_tx, Variable(xp.ones(batchsize, dtype=np.int32) * 2))
+            L_gang = (F.softmax_cross_entropy(sx2, Variable(xp.ones(batchsize, dtype=np.int32) * 2)) 
+                    + F.softmax_cross_entropy(tx2, Variable(xp.ones(batchsize, dtype=np.int32) * 2)))
+
+            L_gen = L_gang + alpha * L_const + beta * L_tid + gamma * L_tv
+
             
             #print "forward done"
 
